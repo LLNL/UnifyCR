@@ -45,13 +45,9 @@
 // margo rpcs
 #include "margo_server.h"
 
-/* PMI information */
-int glb_pmi_rank; /* = 0 */
-int glb_pmi_size = 1; // for standalone server tests
 int server_pid;
 
 char glb_host[UNIFYFS_MAX_HOSTNAME];
-size_t glb_host_ndx;        // index of localhost in glb_servers
 
 size_t glb_num_servers;     // size of glb_servers array
 server_info_t* glb_servers; // array of server_info_t
@@ -187,48 +183,33 @@ static void fini_MPI(void)
 }
 #endif // UNIFYFSD_USE_MPI
 
-static int allocate_servers(size_t n_servers)
-{
-    glb_num_servers = n_servers;
-    glb_servers = (server_info_t*) calloc(n_servers, sizeof(server_info_t));
-    if (NULL == glb_servers) {
-        LOGERR("failed to allocate server_info array");
-        return ENOMEM;
-    }
-    return (int)UNIFYFS_SUCCESS;
-}
-
+#if !defined(UNIFYFSD_USE_MPI) && !defined(USE_PMIX) && !defined(USE_PMI2)
 static int process_servers_hostfile(const char* hostfile)
 {
-    int rc;
-    size_t i, cnt;
-    FILE* fp = NULL;
-    char hostbuf[UNIFYFS_MAX_HOSTNAME+1];
-
     if (NULL == hostfile) {
         return EINVAL;
     }
-    fp = fopen(hostfile, "r");
+
+    FILE* fp = fopen(hostfile, "r");
     if (!fp) {
         LOGERR("failed to open hostfile %s", hostfile);
         return (int)UNIFYFS_FAILURE;
     }
 
     // scan first line: number of hosts
-    rc = fscanf(fp, "%zu\n", &cnt);
+    size_t cnt = 0;
+    int rc = fscanf(fp, "%zu\n", &cnt);
     if (1 != rc) {
         LOGERR("failed to scan hostfile host count");
         fclose(fp);
         return (int)UNIFYFS_FAILURE;
     }
-    rc = allocate_servers(cnt);
-    if ((int)UNIFYFS_SUCCESS != rc) {
-        fclose(fp);
-        return (int)UNIFYFS_FAILURE;
-    }
 
-    // scan host lines
+    // scan host lines to find index of host of this process
+    size_t i;
+    size_t ndx = 0;
     for (i = 0; i < cnt; i++) {
+        char hostbuf[UNIFYFS_MAX_HOSTNAME + 1];
         memset(hostbuf, 0, sizeof(hostbuf));
         rc = fscanf(fp, "%s\n", hostbuf);
         if (1 != rc) {
@@ -237,20 +218,59 @@ static int process_servers_hostfile(const char* hostfile)
             return (int)UNIFYFS_FAILURE;
         }
 
+        // check whether this line matches our hostname
         // NOTE: following assumes one server per host
         if (0 == strcmp(glb_host, hostbuf)) {
-            glb_host_ndx = (int)i;
-            LOGDBG("found myself at hostfile index=%zu, pmi_rank=%d",
-                   glb_host_ndx, glb_pmi_rank);
+            ndx = (int)i;
+            LOGDBG("found myself at hostfile index=%zu", ndx);
         }
     }
     fclose(fp);
 
-    if (glb_pmi_size < cnt) {
-        glb_pmi_rank = (int)glb_host_ndx;
-        glb_pmi_size = (int)cnt;
-        LOGDBG("set pmi rank to host index %d", glb_pmi_rank);
+    glb_pmi_rank = (int)ndx;
+    glb_pmi_size = (int)cnt;
+
+    LOGDBG("set pmi rank to host index %d", glb_pmi_rank);
+
+    return (int)UNIFYFS_SUCCESS;
+}
+#endif
+
+static int get_server_rank_and_size(const unifyfs_cfg_t* cfg)
+{
+    int rc;
+
+/* if not using MPI, PMIX, or PMI2,
+ * initialize rank/size to assume a singleton job */
+#if !defined(UNIFYFSD_USE_MPI) && !defined(USE_PMIX) && !defined(USE_PMI2)
+    glb_pmi_rank = 0;
+    glb_pmi_size = 1;
+#endif
+
+#if defined(UNIFYFSD_USE_MPI)
+    init_MPI(NULL, NULL);
+#elif defined(USE_PMIX)
+    rc = unifyfs_pmix_init();
+    if (rc != (int)UNIFYFS_SUCCESS) {
+        return rc;
     }
+#elif defined(USE_PMI2)
+    rc = unifyfs_pmi2_init();
+    if (rc != (int)UNIFYFS_SUCCESS) {
+        return rc;
+    }
+#else
+    if (NULL != cfg->server_hostfile) {
+        rc = process_servers_hostfile(cfg->server_hostfile);
+        if (rc != (int)UNIFYFS_SUCCESS) {
+            LOGERR("failed to gather server information");
+            exit(1);
+        }
+    }
+#endif
+
+    /* TODO: can we just use glb_pmi_size everywhere instead? */
+    glb_num_servers = glb_pmi_size;
 
     return (int)UNIFYFS_SUCCESS;
 }
@@ -261,7 +281,6 @@ int main(int argc, char* argv[])
     int kv_rank, kv_nranks;
     bool daemon = true;
     struct sigaction sa;
-    char rank_str[16] = {0};
     char dbg_fname[UNIFYFS_MAX_FILENAME] = {0};
 
     rc = unifyfs_config_init(&server_cfg, argc, argv, 0, NULL);
@@ -317,12 +336,10 @@ int main(int argc, char* argv[])
     // initialize empty app_configs[]
     memset(app_configs, 0, sizeof(app_configs));
 
-#if defined(UNIFYFSD_USE_MPI)
-    init_MPI(&argc, &argv);
-#endif
+    // record hostname of this server in global variable
+    gethostname(glb_host, sizeof(glb_host));
 
     // start logging
-    gethostname(glb_host, sizeof(glb_host));
     snprintf(dbg_fname, sizeof(dbg_fname), "%s/%s.%s",
              server_cfg.log_dir, server_cfg.log_file, glb_host);
     rc = unifyfs_log_open(dbg_fname);
@@ -333,12 +350,18 @@ int main(int argc, char* argv[])
     // print config
     unifyfs_config_print(&server_cfg, unifyfs_log_stream);
 
-    if (NULL != server_cfg.server_hostfile) {
-        rc = process_servers_hostfile(server_cfg.server_hostfile);
-        if (rc != (int)UNIFYFS_SUCCESS) {
-            LOGERR("failed to gather server information");
-            exit(1);
-        }
+    /* get rank of this server process and number of servers,
+     * set glb_pmi_rank and glb_pmi_size */
+    rc = get_server_rank_and_size(&server_cfg);
+    if (rc != (int)UNIFYFS_SUCCESS) {
+        LOGERR("failed to get server rank and size");
+        exit(1);
+    }
+
+    /* bail out if we don't have our server rank and group size defined */
+    if (glb_pmi_size <= 0) {
+        LOGERR("failed to read rank and size of server group");
+        exit(1);
     }
 
     kv_rank = glb_pmi_rank;
@@ -356,17 +379,6 @@ int main(int argc, char* argv[])
         LOGDBG("mismatch on pmi (%d) vs kvstore (%d) num ranks",
                glb_pmi_size, kv_nranks);
         glb_pmi_size = kv_nranks;
-    }
-
-    snprintf(rank_str, sizeof(rank_str), "%d", glb_pmi_rank);
-    rc = unifyfs_keyval_publish_remote(key_unifyfsd_pmi_rank, rank_str);
-    if (rc != (int)UNIFYFS_SUCCESS) {
-        exit(1);
-    }
-
-    if (NULL == server_cfg.server_hostfile) {
-        //glb_svr_rank = kv_rank;
-        rc = allocate_servers((size_t)kv_nranks);
     }
 
     LOGDBG("initializing rpc service");

@@ -58,6 +58,9 @@ static size_t kv_max_vallen; // = 0
 # define UNIFYFS_MAX_KV_VALLEN 4096
 #endif
 
+/* PMI information */
+int glb_pmi_rank = -1;
+int glb_pmi_size; /* = 0 */
 
 //--------------------- PMI2 K-V Store ---------------------
 #if defined(USE_PMI2)
@@ -127,7 +130,7 @@ static void unifyfs_pmi2_errstr(int rc)
 }
 
 // initialize PMI2
-static int unifyfs_pmi2_init(void)
+int unifyfs_pmi2_init(void)
 {
     int nprocs, rank, rc, val, len, found;
     int pmi_world_rank = -1;
@@ -190,6 +193,9 @@ static int unifyfs_pmi2_init(void)
 
     kv_myrank = pmi_world_rank;
     kv_nranks = pmi_world_nprocs;
+
+    glb_pmi_rank = kv_myrank;
+    glb_pmi_size = kv_nranks;
 
     LOGDBG("PMI2 Job Id: %s, Rank: %d of %d, hasNameServer=%d", pmi_jobid,
            kv_myrank, kv_nranks, pmi2_has_nameserv);
@@ -294,13 +300,18 @@ static pmix_proc_t pmix_myproc;
 #endif
 
 // initialize PMIx
-static int unifyfs_pmix_init(void)
+int unifyfs_pmix_init(void)
 {
     int rc;
     size_t pmix_univ_nprocs;
     pmix_value_t value;
     pmix_value_t* valp = &value;
     pmix_proc_t proc;
+
+    /* return success if we're already initialized */
+    if (pmix_initialized) {
+        return (int)UNIFYFS_SUCCESS;
+    }
 
     /* init PMIx */
     PMIX_PROC_CONSTRUCT(&pmix_myproc);
@@ -327,6 +338,9 @@ static int unifyfs_pmix_init(void)
 
     kv_myrank = pmix_myproc.rank;
     kv_nranks = (int)pmix_univ_nprocs;
+
+    glb_pmi_rank = kv_myrank;
+    glb_pmi_size = kv_nranks;
 
     LOGDBG("PMIX Job Id: %s, Rank: %d of %d", pmix_myproc.nspace,
            kv_myrank, kv_nranks);
@@ -785,6 +799,7 @@ static int unifyfs_fskv_publish_remote(const char* key,
     return (int)UNIFYFS_SUCCESS;
 }
 
+#if !defined(USE_PMIX) && !defined(USE_PMI2)
 static int unifyfs_fskv_fence(void)
 {
     if (!have_sharedfs_kvstore) {
@@ -800,6 +815,7 @@ static int unifyfs_fskv_fence(void)
 
     return (int)UNIFYFS_SUCCESS;
 }
+#endif
 
 //--------------------- K-V Store API ---------------------
 

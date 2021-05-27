@@ -423,10 +423,15 @@ int margo_server_rpc_finalize(void)
  */
 int margo_connect_servers(void)
 {
-    int rc;
     int ret = (int)UNIFYFS_SUCCESS;
-    size_t i;
-    hg_return_t hret;
+
+    /* publish the pmi rank of this server */
+    char rank_str[16] = {0};
+    snprintf(rank_str, sizeof(rank_str), "%d", glb_pmi_rank);
+    int rc = unifyfs_keyval_publish_remote(key_unifyfsd_pmi_rank, rank_str);
+    if (rc != (int)UNIFYFS_SUCCESS) {
+        exit(1);
+    }
 
     // block until a margo_svr key pair published by all servers
     rc = unifyfs_keyval_fence_remote();
@@ -436,38 +441,55 @@ int margo_connect_servers(void)
         return ret;
     }
 
-    for (i = 0; i < glb_num_servers; i++) {
-        int remote_pmi_rank = -1;
-        char* pmi_rank_str = NULL;
-        char* margo_addr_str = NULL;
+    /* allocate array of structs to record margo address for each server */
+    glb_servers = (server_info_t*) calloc(glb_num_servers,
+        sizeof(server_info_t));
+    if (NULL == glb_servers) {
+        LOGERR("failed to allocate server_info array");
+        return ENOMEM;
+    }
 
+    /* lookup address string for each server, and optionally connect */
+    size_t i;
+    for (i = 0; i < glb_num_servers; i++) {
+        /* TODO: will this be different from i now? */
+        /* lookup pmi rank for this server */
+        char* pmi_rank_str = NULL;
         rc = unifyfs_keyval_lookup_remote(i, key_unifyfsd_pmi_rank,
-                                          &pmi_rank_str);
+            &pmi_rank_str);
         if ((int)UNIFYFS_SUCCESS != rc) {
             LOGERR("server index=%zu - pmi rank lookup failed", i);
             ret = (int)UNIFYFS_FAILURE;
             return ret;
         }
+
+        /* convert pmi rank string to int and record it */
+        int remote_pmi_rank = -1;
         if (NULL != pmi_rank_str) {
             remote_pmi_rank = atoi(pmi_rank_str);
             free(pmi_rank_str);
         }
-        glb_servers[i].pmi_rank = remote_pmi_rank;
 
-        margo_addr_str = rpc_lookup_remote_server_addr(i);
+        /* lookup margo address string for this server */
+        char* margo_addr_str = rpc_lookup_remote_server_addr(i);
         if (NULL == margo_addr_str) {
             LOGERR("server index=%zu - margo server lookup failed", i);
             ret = (int)UNIFYFS_FAILURE;
             return ret;
         }
+
+        /* record values on struct for this server */
+        glb_servers[i].pmi_rank = remote_pmi_rank;
         glb_servers[i].margo_svr_addr = HG_ADDR_NULL;
         glb_servers[i].margo_svr_addr_str = margo_addr_str;
         LOGDBG("server index=%zu, pmi_rank=%d, margo_addr=%s",
                i, remote_pmi_rank, margo_addr_str);
+
+        /* connect to each server now if not using lazy connect */
         if (!margo_lazy_connect) {
-            hret = margo_addr_lookup(unifyfsd_rpc_context->svr_mid,
-                                     glb_servers[i].margo_svr_addr_str,
-                                     &(glb_servers[i].margo_svr_addr));
+            hg_return_t hret = margo_addr_lookup(unifyfsd_rpc_context->svr_mid,
+                glb_servers[i].margo_svr_addr_str,
+                &(glb_servers[i].margo_svr_addr));
             if (hret != HG_SUCCESS) {
                 LOGERR("server index=%zu - margo_addr_lookup(%s) failed",
                        i, margo_addr_str);
